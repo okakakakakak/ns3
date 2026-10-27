@@ -46,11 +46,12 @@ static const uint32_t MAX_APP_RETRIES = 5;
 
 static bool g_somExecuted[3] = {false, false, false};
 
-// 【新規追加】重複アソシエーションを防ぐための接続完了フラグ
+// 重複アソシエーションを防ぐための接続完了フラグ
 static std::map<uint32_t, bool> g_nodeIsAssociated;
 
+
 // ==========================================
-// 実環境エッジコンピューティング用パケット定義
+// パケット定義・キャッシュ構造体
 // ==========================================
 
 struct AnchorInfoMessage 
@@ -62,7 +63,8 @@ struct AnchorInfoMessage
     uint8_t macAddr[2];
 };
 
-struct NodeReportMessage {
+struct NodeReportMessage 
+{
     uint8_t msgType; 
     uint32_t nodeId;
     double x;
@@ -70,29 +72,29 @@ struct NodeReportMessage {
     int targetAnchorIndex;
 };
 
-struct ScheduleCommandMessage {
+struct ScheduleCommandMessage 
+{
     uint8_t msgType; 
     uint32_t targetNodeId;
     double delayMilliseconds; 
 };
 
-// ==========================================
-// キャッシュ・データ保持用構造体
-// ==========================================
-
-struct NodeCacheInfo {
+struct NodeCacheInfo 
+{
     Vector rawPos;
     Mac16Address shortAddr; 
 };
 static std::map<int, std::map<uint32_t, NodeCacheInfo>> g_coordinatorCaches;
 
-struct AnchorData {
+struct AnchorData 
+{
     int id;
     Vector pos;
 };
 static std::map<uint32_t, std::map<Mac16Address, AnchorData>> g_nodeKnownAnchors;
 
-struct NodeContext {
+struct NodeContext 
+{
     Ptr<LrWpanNetDevice> device;
     MlmeAssociateRequestParams assocParams;
     Vector actualPosition;
@@ -102,42 +104,67 @@ struct NodeContext {
 };
 static std::map<uint32_t, NodeContext> g_nodeContexts;
 
+
 // ==========================================
-// 補助関数群
+// 補助関数群（計算・カウント）
 // ==========================================
 
-static double EstimateDistanceFromRssi(int8_t rssi) {
+static double EstimateDistanceFromRssi(int8_t rssi) 
+{
     double rssiAt1m = ENV_TX_POWER - ENV_REF_LOSS;
     return std::pow(10.0, (rssiAt1m - static_cast<double>(rssi)) / (10.0 * ENV_EXPONENT));
 }
 
-static Vector TrilateratePosition(double d1, double d2, double d3) {
+static Vector TrilateratePosition(double d1, double d2, double d3) 
+{
     double x = (d1 * d1 - d2 * d2 + 2500.0) / 100.0;
     double y = (d1 * d1 - d3 * d3 + 3125.0 - 50.0 * x) / 100.0;
     return Vector(x, y, 0.0);
 }
 
-static double Distance2d(const Vector& a, const Vector& b) {
+static double Distance2d(const Vector& a, const Vector& b) 
+{
     double dx = a.x - b.x;
     double dy = a.y - b.y;
     return std::sqrt(dx * dx + dy * dy);
 }
 
-static void MacTxCount(std::string context, Ptr<const Packet> packet) {
+static void MacTxCount(std::string context, Ptr<const Packet> packet) 
+{
     g_totalTxPackets++;
 }
 
+// 物理層フック：MAC層へ渡る前に生RSSI(dBm)を横取りして記録する
+static void RecordPdDataIndication(uint32_t nodeId, Ptr<LrWpanMac> mac, uint32_t psduLength, Ptr<Packet> p, uint8_t lqi, int8_t rssi) 
+{
+    LrWpanMacHeader hdr; Ptr<Packet> packetCopy = p->Copy();
+    if (packetCopy->PeekHeader(hdr)) 
+    {
+        if (hdr.GetType() == LrWpanMacHeader::LRWPAN_MAC_BEACON && hdr.GetSrcAddrMode() == LrWpanMacHeader::SHORTADDR) 
+        {
+            g_nodeRssiShort[nodeId][hdr.GetShortSrcAddr()] = rssi;
+        }
+    }
+    mac->PdDataIndication(psduLength, p, lqi, rssi);
+}
+
+
 // ==========================================
-// 通信・アソシエーションロジック
+// リカバリ・再送制御ロジック
 // ==========================================
 
-static void RetryConnection(Ptr<LrWpanNetDevice> device) {
+static void RetryConnection(Ptr<LrWpanNetDevice> device) 
+{
     uint32_t nodeId = device->GetNode()->GetId();
     
-    // 【修正】すでに接続成功済みの場合は再送しない
-    if (g_nodeIsAssociated[nodeId]) return;
+    // すでに接続成功済みの場合は再送しない
+    if (g_nodeIsAssociated[nodeId])
+    {
+        return;
+    }
 
-    if (g_nodeRetryCounts[nodeId] < MAX_APP_RETRIES) {
+    if (g_nodeRetryCounts[nodeId] < MAX_APP_RETRIES) 
+    {
         g_nodeRetryCounts[nodeId]++;
         Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
         double backoff = uv->GetValue(1.0, 5.0); 
@@ -154,33 +181,34 @@ static void RetryConnection(Ptr<LrWpanNetDevice> device) {
         scanParams.m_scanType = MLMESCAN_ACTIVE;
 
         Simulator::ScheduleWithContext(nodeId, Seconds(backoff), &LrWpanMac::MlmeScanRequest, device->GetMac(), scanParams);
-    } else {
+    } 
+    else 
+    {
         std::cout << Simulator::Now().GetSeconds() << "s [Node " << nodeId << "] Max retries reached. Giving up.\n";
     }
 }
 
-static void ScheduleCommandTimeout(Ptr<LrWpanNetDevice> device) {
+static void ScheduleCommandTimeout(Ptr<LrWpanNetDevice> device) 
+{
     uint32_t nodeId = device->GetNode()->GetId();
     
-    // 【修正】すでに接続成功済みの場合はタイムアウトを無視する
-    if (g_nodeIsAssociated[nodeId]) return;
+    if (g_nodeIsAssociated[nodeId]) 
+    {
+        return;
+    }
 
     std::cout << Simulator::Now().GetSeconds() << "s [Node " << nodeId 
               << "] Schedule Command Timeout! Request/Command packet lost. Retrying...\n";
     RetryConnection(device); 
 }
 
-static void RecordPdDataIndication(uint32_t nodeId, Ptr<LrWpanMac> mac, uint32_t psduLength, Ptr<Packet> p, uint8_t lqi, int8_t rssi) {
-    LrWpanMacHeader hdr; Ptr<Packet> packetCopy = p->Copy();
-    if (packetCopy->PeekHeader(hdr)) {
-        if (hdr.GetType() == LrWpanMacHeader::LRWPAN_MAC_BEACON && hdr.GetSrcAddrMode() == LrWpanMacHeader::SHORTADDR) {
-            g_nodeRssiShort[nodeId][hdr.GetShortSrcAddr()] = rssi;
-        }
-    }
-    mac->PdDataIndication(psduLength, p, lqi, rssi);
-}
 
-static void BroadcastAnchorInfo(Ptr<LrWpanNetDevice> coorDevice, int anchorId, Vector pos) {
+// ==========================================
+// 【Step 1】アンカーからノードへの座標共有
+// ==========================================
+
+static void BroadcastAnchorInfo(Ptr<LrWpanNetDevice> coorDevice, int anchorId, Vector pos) 
+{
     AnchorInfoMessage msg;
     msg.msgType = 0;
     msg.anchorId = anchorId;
@@ -204,31 +232,45 @@ static void BroadcastAnchorInfo(Ptr<LrWpanNetDevice> coorDevice, int anchorId, V
     coorDevice->GetMac()->McpsDataRequest(dataParams, p);
 }
 
-static void NodeDataIndication(uint32_t nodeId, Ptr<LrWpanNetDevice> device, McpsDataIndicationParams params, Ptr<Packet> p) {
-    // 【修正】すでに接続成功済みのノードは余計なデータパケットを処理しない
-    if (g_nodeIsAssociated[nodeId]) return;
+
+// ==========================================
+// 【パケット受信処理】ノード側・アンカー側
+// ==========================================
+
+// ノード側：アンカー情報の学習(Step 1) と、下りスケジュール指示(Step 4)の受信
+static void NodeDataIndication(uint32_t nodeId, Ptr<LrWpanNetDevice> device, McpsDataIndicationParams params, Ptr<Packet> p) 
+{
+    if (g_nodeIsAssociated[nodeId]) 
+    {
+        return;
+    }
 
     uint8_t msgType;
     p->CopyData(&msgType, 1);
     
-    if (msgType == 0 && p->GetSize() >= sizeof(AnchorInfoMessage)) {
+    if (msgType == 0 && p->GetSize() >= sizeof(AnchorInfoMessage)) 
+    {
         AnchorInfoMessage msg;
         p->CopyData(reinterpret_cast<uint8_t*>(&msg), sizeof(AnchorInfoMessage));
         Mac16Address mac; mac.CopyFrom(msg.macAddr);
         g_nodeKnownAnchors[nodeId][mac] = {msg.anchorId, Vector(msg.x, msg.y, 0)};
         
-    } else if (msgType == 2 && p->GetSize() >= sizeof(ScheduleCommandMessage)) {
+    } 
+    else if (msgType == 2 && p->GetSize() >= sizeof(ScheduleCommandMessage)) 
+    {
         ScheduleCommandMessage msg;
         p->CopyData(reinterpret_cast<uint8_t*>(&msg), sizeof(ScheduleCommandMessage));
         
-        if (msg.targetNodeId == nodeId) {
-            if (g_nodeContexts.find(nodeId) != g_nodeContexts.end()) {
+        if (msg.targetNodeId == nodeId) 
+        {
+            if (g_nodeContexts.find(nodeId) != g_nodeContexts.end()) 
+            {
                 auto& ctx = g_nodeContexts[nodeId];
                 
-                // 指示が無事に届いたので、待ちぼうけタイムアウトをキャンセルする
                 Simulator::Cancel(ctx.scheduleTimeoutEvent);
 
-                if (g_firstAssocScheduleTime < 0.0) {
+                if (g_firstAssocScheduleTime < 0.0) 
+                {
                     g_firstAssocScheduleTime = Simulator::Now().GetSeconds() + (msg.delayMilliseconds / 1000.0);
                 }
 
@@ -242,11 +284,14 @@ static void NodeDataIndication(uint32_t nodeId, Ptr<LrWpanNetDevice> device, Mcp
     }
 }
 
-static void CoordinatorDataIndication(int anchorId, Ptr<LrWpanNetDevice> coorDevice, McpsDataIndicationParams params, Ptr<Packet> p) {
+// アンカー側：ノードからのRaw座標報告(Step 3)の受信
+static void CoordinatorDataIndication(int anchorId, Ptr<LrWpanNetDevice> coorDevice, McpsDataIndicationParams params, Ptr<Packet> p) 
+{
     uint8_t msgType;
     p->CopyData(&msgType, 1);
     
-    if (msgType == 1 && p->GetSize() >= sizeof(NodeReportMessage)) {
+    if (msgType == 1 && p->GetSize() >= sizeof(NodeReportMessage)) 
+    {
         NodeReportMessage msg;
         p->CopyData(reinterpret_cast<uint8_t*>(&msg), sizeof(NodeReportMessage));
         
@@ -255,11 +300,22 @@ static void CoordinatorDataIndication(int anchorId, Ptr<LrWpanNetDevice> coorDev
         std::cout << Simulator::Now().GetSeconds() << "s [Coordinator " << anchorId 
                   << "] Received Raw Position from Node " << msg.nodeId << "\n";
 
-        if (g_somExecuted[anchorId]) {
+        // 遅れて再送されてきた座標データに対する、個別の即時スケジュール指示返信
+        if (g_somExecuted[anchorId]) 
+        {
             Vector anchorPos(0,0,0);
-            if (anchorId == 0) anchorPos = Vector(0, 0, 0);
-            else if (anchorId == 1) anchorPos = Vector(50, 0, 0);
-            else if (anchorId == 2) anchorPos = Vector(25, 50, 0);
+            if (anchorId == 0) 
+            {
+                anchorPos = Vector(0, 0, 0);
+            }
+            else if (anchorId == 1) 
+            {
+                anchorPos = Vector(50, 0, 0);
+            }
+            else if (anchorId == 2) 
+            {
+                anchorPos = Vector(25, 50, 0);
+            }
 
             double distance = Distance2d(Vector(msg.x, msg.y, 0.0), anchorPos);
             double delayMs = (0.1 * distance) * 1000.0;
@@ -284,13 +340,22 @@ static void CoordinatorDataIndication(int anchorId, Ptr<LrWpanNetDevice> coorDev
     }
 }
 
-static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams params) {
+
+// ==========================================
+// 【Step 2 & 3】ネットワーク探索と初期測位報告
+// ==========================================
+
+static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams params) 
+{
     uint32_t nodeId = device->GetNode()->GetId();
     
-    // 【修正】すでに接続成功済みの場合は処理しない
-    if (g_nodeIsAssociated[nodeId]) return;
+    if (g_nodeIsAssociated[nodeId]) 
+    {
+        return;
+    }
 
-    if (params.m_status != MacStatus::SUCCESS || params.m_panDescList.empty()) {
+    if (params.m_status != MacStatus::SUCCESS || params.m_panDescList.empty()) 
+    {
         std::cout << Simulator::Now().GetSeconds() << "s Node " << nodeId << " MLME-scan.confirm: FAILED (No Beacons)\n";
         RetryConnection(device);
         return;
@@ -300,14 +365,21 @@ static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams param
     double minDistance = std::numeric_limits<double>::infinity();
     int panDescIndex = -1;
 
-    for (uint32_t i = 0; i < params.m_panDescList.size(); i++) {
+    for (uint32_t i = 0; i < params.m_panDescList.size(); i++)
+    {
         SuperframeField superframe(params.m_panDescList[i].m_superframeSpec);
-        if (!superframe.IsAssocPermit()) continue;
-        if (params.m_panDescList[i].m_coorAddrMode == SHORT_ADDR) {
+        if (!superframe.IsAssocPermit()) 
+        {
+            continue;
+        }
+        if (params.m_panDescList[i].m_coorAddrMode == SHORT_ADDR) 
+        {
             auto it = myShortRssi.find(params.m_panDescList[i].m_coorShortAddr);
-            if (it != myShortRssi.end()) {
+            if (it != myShortRssi.end()) 
+            {
                 double estimatedDistance = EstimateDistanceFromRssi(it->second);
-                if (estimatedDistance < minDistance) {
+                if (estimatedDistance < minDistance) 
+                {
                     minDistance = estimatedDistance;
                     panDescIndex = i;
                 }
@@ -315,31 +387,37 @@ static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams param
         }
     }
 
-    if (panDescIndex < 0) {
+    if (panDescIndex < 0) 
+    {
         RetryConnection(device);
         return;
     }
 
     std::map<int, double> anchorDistances;
-    for (auto const& [mac, rssi] : myShortRssi) {
-        if (g_nodeKnownAnchors[nodeId].find(mac) != g_nodeKnownAnchors[nodeId].end()) {
+    for (auto const& [mac, rssi] : myShortRssi) 
+    {
+        if (g_nodeKnownAnchors[nodeId].find(mac) != g_nodeKnownAnchors[nodeId].end()) 
+        {
             int aId = g_nodeKnownAnchors[nodeId][mac].id;
             anchorDistances[aId] = EstimateDistanceFromRssi(rssi);
         }
     }
 
-    if (anchorDistances.count(0) && anchorDistances.count(1) && anchorDistances.count(2)) {
+    if (anchorDistances.count(0) && anchorDistances.count(1) && anchorDistances.count(2)) 
+    {
         double d1 = anchorDistances[0];
         double d2 = anchorDistances[1];
         double d3 = anchorDistances[2];
         
         Mac16Address targetMac = params.m_panDescList[panDescIndex].m_coorShortAddr;
         int anchorId = -1;
-        if (g_nodeKnownAnchors[nodeId].find(targetMac) != g_nodeKnownAnchors[nodeId].end()) {
+        if (g_nodeKnownAnchors[nodeId].find(targetMac) != g_nodeKnownAnchors[nodeId].end()) 
+        {
             anchorId = g_nodeKnownAnchors[nodeId][targetMac].id;
         }
 
-        if (anchorId == -1) {
+        if (anchorId == -1) 
+        {
              RetryConnection(device); return;
         }
 
@@ -356,9 +434,7 @@ static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams param
         Ptr<ConstantPositionMobilityModel> actualMobility = device->GetNode()->GetObject<ConstantPositionMobilityModel>();
         Vector actualPosition = actualMobility ? actualMobility->GetPosition() : Vector(0,0,0);
 
-        // 【修正】アンカーの処理（8.1秒）を確実に待てるよう、タイムアウトを6.0秒に延長
         EventId timeoutEvent = Simulator::Schedule(Seconds(6.0), &ScheduleCommandTimeout, device);
-
         g_nodeContexts[nodeId] = {device, assocParams, actualPosition, rawPos, anchorId, timeoutEvent};
 
         NodeReportMessage msg;
@@ -378,27 +454,40 @@ static void ScanConfirm(Ptr<LrWpanNetDevice> device, MlmeScanConfirmParams param
 
         device->GetMac()->McpsDataRequest(dataParams, p);
 
-    } else {
+    } 
+    else 
+    {
         RetryConnection(device);
     }
 }
 
-static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> coorDevice) {
+
+// ==========================================
+// 【Step 4】アンカーによるSOM補正とスケジュール指示
+// ==========================================
+
+static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> coorDevice) 
+{
     g_somExecuted[anchorId] = true; 
 
     auto& cache = g_coordinatorCaches[anchorId];
-    if (cache.empty()) return;
+    if (cache.empty()) 
+    {
+        return;
+    }
 
     std::cout << "\n=== [Coordinator " << anchorId << "] Starting local SOM with " << cache.size() << " nodes ===" << std::endl;
 
-    struct NodeItem {
+    struct NodeItem 
+    {
         uint32_t id;
         Vector raw;
         Vector som;
         Mac16Address shortAddr;
     };
     std::vector<NodeItem> items;
-    for (auto const& [nodeId, info] : cache) {
+    for (auto const& [nodeId, info] : cache) 
+    {
         items.push_back({nodeId, info.rawPos, info.rawPos, info.shortAddr});
     }
 
@@ -407,27 +496,36 @@ static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> 
     double neighbor_range = 10.0;
     int num_items = items.size();
 
-    if (num_items > 1) {
-        for (int iter = 1; iter <= max_iterations; ++iter) {
+    if (num_items > 1) 
+    {
+        for (int iter = 1; iter <= max_iterations; ++iter) 
+        {
             double alpha = initial_alpha * (1.0 - static_cast<double>(iter - 1) / max_iterations);
             std::vector<Vector> next_coords(num_items);
 
-            for (int i = 0; i < num_items; ++i) {
+            for (int i = 0; i < num_items; ++i) 
+            {
                 double sum_x = items[i].som.x;
                 double sum_y = items[i].som.y;
                 int neighbor_count = 1; 
 
-                for (int j = 0; j < num_items; ++j) {
-                    if (i == j) continue;
+                for (int j = 0; j < num_items; ++j) 
+                {
+                    if (i == j) 
+                    {
+                        continue;
+                    }
                     double dist = Distance2d(items[i].som, items[j].som);
-                    if (dist < neighbor_range) {
+                    if (dist < neighbor_range) 
+                    {
                         sum_x += items[j].som.x;
                         sum_y += items[j].som.y;
                         neighbor_count++;
                     }
                 }
 
-                if (neighbor_count > 1) { 
+                if (neighbor_count > 1) 
+                { 
                     double centroid_x = sum_x / neighbor_count;
                     double centroid_y = sum_y / neighbor_count;
                     double pull_to_raw_x = items[i].raw.x - items[i].som.x;
@@ -436,24 +534,40 @@ static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> 
                     next_coords[i].x = items[i].som.x + alpha * (centroid_x - items[i].som.x) + (alpha * 0.5) * pull_to_raw_x;
                     next_coords[i].y = items[i].som.y + alpha * (centroid_y - items[i].som.y) + (alpha * 0.5) * pull_to_raw_y;
                     next_coords[i].z = 0.0;
-                } else {
+                } 
+                else 
+                {
                     next_coords[i] = items[i].som;
                 }
             }
-            for (int i = 0; i < num_items; ++i) {
+            for (int i = 0; i < num_items; ++i) 
+            {
                 items[i].som = next_coords[i];
             }
         }
     }
 
     Vector anchorPos(0,0,0);
-    if (anchorId == 0) anchorPos = Vector(0, 0, 0);
-    else if (anchorId == 1) anchorPos = Vector(50, 0, 0);
-    else if (anchorId == 2) anchorPos = Vector(25, 50, 0);
+    if (anchorId == 0) 
+    {
+        anchorPos = Vector(0, 0, 0);
+    }
+    else if (anchorId == 1) 
+    {
+        anchorPos = Vector(50, 0, 0);
+    }
+    else if (anchorId == 2) 
+    {
+        anchorPos = Vector(25, 50, 0);
+    }
 
-    for (auto const& item : items) {
+    for (auto const& item : items) 
+    {
         uint32_t nodeId = item.id;
-        if (g_nodeContexts.find(nodeId) == g_nodeContexts.end()) continue;
+        if (g_nodeContexts.find(nodeId) == g_nodeContexts.end()) 
+        {
+            continue;
+        }
 
         auto& ctx = g_nodeContexts[nodeId];
         Vector somCoord = item.som;
@@ -494,7 +608,13 @@ static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> 
     }
 }
 
-static void AssociateIndication(Ptr<LrWpanNetDevice> device, MlmeAssociateIndicationParams params) {
+
+// ==========================================
+// 【Step 5】アソシエーション（接続実行と確認）
+// ==========================================
+
+static void AssociateIndication(Ptr<LrWpanNetDevice> device, MlmeAssociateIndicationParams params) 
+{
     MlmeAssociateResponseParams assocRespParams;
     assocRespParams.m_extDevAddr = params.m_extDevAddr;
     assocRespParams.m_status = MacStatus::SUCCESS;
@@ -508,43 +628,61 @@ static void AssociateIndication(Ptr<LrWpanNetDevice> device, MlmeAssociateIndica
     Simulator::ScheduleNow(&LrWpanMac::MlmeAssociateResponse, device->GetMac(), assocRespParams);
 }
 
-static void AssociateConfirm(Ptr<LrWpanNetDevice> device, MlmeAssociateConfirmParams params) {
+static void AssociateConfirm(Ptr<LrWpanNetDevice> device, MlmeAssociateConfirmParams params) 
+{
     uint32_t nodeId = device->GetNode()->GetId();
     double currentTime = Simulator::Now().GetSeconds();
 
-    if (params.m_status == MacStatus::SUCCESS) {
-        // 【修正】すでに成功としてカウントされているノードは重複処理しない
-        if (g_nodeIsAssociated[nodeId]) return;
+    if (params.m_status == MacStatus::SUCCESS) 
+    {
+        if (g_nodeIsAssociated[nodeId]) 
+        {
+            return;
+        }
 
-        g_nodeIsAssociated[nodeId] = true; // 接続成功フラグを立てる
+        g_nodeIsAssociated[nodeId] = true; 
         g_associatedNodes++;
-        if (currentTime > g_lastAssociationTime) { g_lastAssociationTime = currentTime; }
+        if (currentTime > g_lastAssociationTime) 
+        { 
+            g_lastAssociationTime = currentTime; 
+        }
         g_lastAssocConfirmTime = currentTime;
         std::cout << currentTime << "s Node " << nodeId << " MLME-assoc: SUCCESS\n";
-    } else {
+    } 
+    else 
+    {
         std::cout << currentTime << "s Node " << nodeId 
                   << " MLME-assoc: FAILED (Status: " << params.m_status << ")\n";
         RetryConnection(device);
     }
 }
 
-static void PrintSimulationResults(uint32_t totalNodes) {
+
+// ==========================================
+// シミュレーション結果出力およびメイン関数
+// ==========================================
+
+static void PrintSimulationResults(uint32_t totalNodes) 
+{
     std::cout << "\n=== COORDINATOR-AGGREGATED SOM METHOD SUMMARY ===\n";
     std::cout << "Attempted: " << totalNodes << " | Success: " << g_associatedNodes << " (" << (g_associatedNodes * 100.0 / totalNodes) << "%)\n";
     std::cout << "Completion Time: " << g_lastAssociationTime << "s | Total Packets: " << g_totalTxPackets << "\n";
     
-    if (g_firstAssocScheduleTime >= 0.0 && g_lastAssocConfirmTime >= g_firstAssocScheduleTime) {
+    if (g_firstAssocScheduleTime >= 0.0 && g_lastAssocConfirmTime >= g_firstAssocScheduleTime) 
+    {
         double totalProcessSpan = g_lastAssocConfirmTime - g_firstAssocScheduleTime;
         std::cout << "Total Association Process Span (First Request Schedule -> Last Confirm Success): " << totalProcessSpan << "s\n";
     }
 
-    if (g_positionSamples > 0) {
+    if (g_positionSamples > 0) 
+    {
         std::cout << "Average Raw Position Error: " << (g_totalRawPositionError / g_positionSamples) << "m\n";
         std::cout << "Average SOM Position Error: " << (g_totalSomPositionError / g_positionSamples) << "m\n";
     }
 }
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) 
+{
     uint32_t numNodes = 10;
     CommandLine cmd(__FILE__);
     cmd.AddValue("numNodes", "Number of nodes", numNodes);
@@ -576,16 +714,23 @@ int main(int argc, char* argv[]) {
     coordMobility.SetPositionAllocator(coordAlloc);
     coordMobility.Install(coordinators);
 
-    auto RandomPointInTriangle = [&](const Vector& a, const Vector& b, const Vector& c) {
+    auto RandomPointInTriangle = [&](const Vector& a, const Vector& b, const Vector& c) 
+    {
         static std::random_device rd; static std::mt19937 rng(rd());
         std::uniform_real_distribution<double> dist(0.0, 1.0);
         double u = dist(rng); double v = dist(rng);
-        if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+        if (u + v > 1.0) 
+        {
+            u = 1.0 - u; v = 1.0 - v; 
+        }
         return Vector(a.x + u * (b.x - a.x) + v * (c.x - a.x), a.y + u * (b.y - a.y) + v * (c.y - a.y), 0);
     };
 
     Ptr<ListPositionAllocator> nodePosAlloc = CreateObject<ListPositionAllocator>();
-    for (uint32_t i = 0; i < nodes.GetN(); ++i) { nodePosAlloc->Add(RandomPointInTriangle(coordA, coordB, coordC)); }
+    for (uint32_t i = 0; i < nodes.GetN(); ++i) 
+    {
+        nodePosAlloc->Add(RandomPointInTriangle(coordA, coordB, coordC)); 
+    }
     MobilityHelper nodeMobility;
     nodeMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     nodeMobility.SetPositionAllocator(nodePosAlloc);
@@ -601,11 +746,11 @@ int main(int argc, char* argv[]) {
     lrWpanHelper.EnablePcapAll(pcapPrefix, true);
     Config::Connect("/NodeList/*/DeviceList/*/Mac/MacTx", MakeCallback(&MacTxCount));
 
-    for (uint32_t i = 0; i < nodes.GetN(); ++i) {
+    for (uint32_t i = 0; i < nodes.GetN(); ++i) 
+    {
         Ptr<LrWpanNetDevice> nodeDevice = DynamicCast<LrWpanNetDevice>(nodes.Get(i)->GetDevice(0));
         uint32_t nodeId = nodes.Get(i)->GetId();
 
-        // 【初期化】接続フラグと再送カウントをゼロにする
         g_nodeIsAssociated[nodeId] = false;
         g_nodeRetryCounts[nodeId] = 0; 
 
@@ -625,14 +770,15 @@ int main(int argc, char* argv[]) {
 
         MlmeScanRequestParams scanParams;
         scanParams.m_chPage = 0; 
-        scanParams.m_scanChannels = 0x0800; // チャンネル11
+        scanParams.m_scanChannels = 0x0800; 
         scanParams.m_scanDuration = 3; 
         scanParams.m_scanType = MLMESCAN_ACTIVE;
         
         Simulator::ScheduleWithContext(nodeId, Seconds(3) + MilliSeconds(i * 50), &LrWpanMac::MlmeScanRequest, nodeDevice->GetMac(), scanParams);
     }
     
-    for (uint32_t i = 0; i < coordinators.GetN(); ++i) {
+    for (uint32_t i = 0; i < coordinators.GetN(); ++i) 
+    {
         Ptr<LrWpanNetDevice> coorDevice = DynamicCast<LrWpanNetDevice>(coordinators.Get(i)->GetDevice(0));
         coorDevice->GetMac()->SetMlmeAssociateIndicationCallback(MakeBoundCallback(&AssociateIndication, coorDevice));
         coorDevice->GetMac()->SetMcpsDataIndicationCallback(MakeBoundCallback(&CoordinatorDataIndication, i, coorDevice));
@@ -650,7 +796,7 @@ int main(int argc, char* argv[]) {
         params.m_panCoor = true; 
         params.m_PanId = 0x0005;
         params.m_bcnOrd = 15; params.m_sfrmOrd = 15; 
-        params.m_logCh = 11; // チャンネル11
+        params.m_logCh = 11; 
         Simulator::ScheduleWithContext(coorDevice->GetNode()->GetId(), Seconds(2), &LrWpanMac::MlmeStartRequest, coorDevice->GetMac(), params);
         coorDevice->GetMac()->m_macAssociationPermit = true;
 
