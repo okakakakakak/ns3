@@ -57,6 +57,9 @@ static bool g_somExecuted[3] = {false, false, false};
 // 重複アソシエーションを防ぐための接続完了フラグ
 static std::map<uint32_t, bool> g_nodeIsAssociated;
 
+// 各コーディネーターが発行するショートアドレスの現在値（DHCPプール）
+static std::map<int, uint16_t> g_coorNextShortAddress;
+
 
 // ==========================================
 // パケット定義・キャッシュ構造体
@@ -635,17 +638,27 @@ static void CoordinatorExecuteSomAndSchedule(int anchorId, Ptr<LrWpanNetDevice> 
 // 【Step 5】アソシエーション（接続実行と確認）
 // ==========================================
 
-static void AssociateIndication(Ptr<LrWpanNetDevice> device, MlmeAssociateIndicationParams params) 
+// 【引数追加】どのアンカーが呼ばれたか判別するため anchorId を受け取る
+static void AssociateIndication(int anchorId, Ptr<LrWpanNetDevice> device, MlmeAssociateIndicationParams params) 
 {
     MlmeAssociateResponseParams assocRespParams;
     assocRespParams.m_extDevAddr = params.m_extDevAddr;
     assocRespParams.m_status = MacStatus::SUCCESS;
     
-    uint8_t buffer64MacAddr[8]; 
+    // アドレスプールの初期化（最初の1回だけ実行）
+    if (g_coorNextShortAddress.find(anchorId) == g_coorNextShortAddress.end()) 
+    {
+        // アンカー0は0x1001～, アンカー1は0x2001～, アンカー2は0x3001～ という規則で開始値を設定
+        g_coorNextShortAddress[anchorId] = ((anchorId + 1) << 12) | 0x0001; 
+    }
+
+    // 次のショートアドレスを割り当てて、プールの現在値を1進める
+    uint16_t allocatedAddr = g_coorNextShortAddress[anchorId]++;
+    
     uint8_t buffer16MacAddr[2];
-    params.m_extDevAddr.CopyTo(buffer64MacAddr);
-    buffer16MacAddr[1] = buffer64MacAddr[7]; 
-    buffer16MacAddr[0] = buffer64MacAddr[6];
+    buffer16MacAddr[0] = (allocatedAddr >> 8) & 0xFF; // 上位バイト (例: 0x10)
+    buffer16MacAddr[1] = allocatedAddr & 0xFF;        // 下位バイト (例: 0x01)
+    
     Mac16Address shortAddr; 
     shortAddr.CopyFrom(buffer16MacAddr);
     assocRespParams.m_assocShortAddr = shortAddr;
@@ -746,16 +759,16 @@ int main(int argc, char* argv[])
     coordMobility.SetPositionAllocator(coordAlloc);
     coordMobility.Install(coordinators);
 
+    //Seedの値によってノードの位置が変わるように、UniformRandomVariableを使って三角形内にランダム配置
+    Ptr<UniformRandomVariable> uv = CreateObject<UniformRandomVariable>();
     auto RandomPointInTriangle = [&](const Vector& a, const Vector& b, const Vector& c) 
     {
-        static std::random_device rd; 
-        static std::mt19937 rng(rd());
-        std::uniform_real_distribution<double> dist(0.0, 1.0);
-        double u = dist(rng); 
-        double v = dist(rng);
+        double u = uv->GetValue(0.0, 1.0);
+        double v = uv->GetValue(0.0, 1.0);
         if (u + v > 1.0) 
-        {
-            u = 1.0 - u; v = 1.0 - v; 
+        { 
+            u = 1.0 - u; 
+            v = 1.0 - v; 
         }
         return Vector(a.x + u * (b.x - a.x) + v * (c.x - a.x), a.y + u * (b.y - a.y) + v * (c.y - a.y), 0);
     };
@@ -796,10 +809,7 @@ int main(int argc, char* argv[])
         uint8_t addrBuffer[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, static_cast<uint8_t>(i + 1)};
         extAddr.CopyFrom(addrBuffer);
         nodeDevice->GetMac()->SetExtendedAddress(extAddr);
-        Mac16Address shortAddr;
-        uint8_t shortAddrBuffer[2] = {0x00, static_cast<uint8_t>(i + 1)};
-        shortAddr.CopyFrom(shortAddrBuffer);
-        nodeDevice->GetMac()->SetShortAddress(shortAddr);
+        // 実機環境の仕様に準拠するため、ノードへのショートアドレスの事前付与を廃止
 
         // 【修正】各コールバック関数に、ノード固有の「メモ帳(localState)」を紐付けて（バインドして）渡す
         nodeDevice->GetMac()->SetMlmeScanConfirmCallback(MakeBoundCallback(&ScanConfirm, localState, nodeDevice));
@@ -819,7 +829,7 @@ int main(int argc, char* argv[])
     for (uint32_t i = 0; i < coordinators.GetN(); ++i) 
     {
         Ptr<LrWpanNetDevice> coorDevice = DynamicCast<LrWpanNetDevice>(coordinators.Get(i)->GetDevice(0));
-        coorDevice->GetMac()->SetMlmeAssociateIndicationCallback(MakeBoundCallback(&AssociateIndication, coorDevice));
+        coorDevice->GetMac()->SetMlmeAssociateIndicationCallback(MakeBoundCallback(&AssociateIndication, i, coorDevice));
         coorDevice->GetMac()->SetMcpsDataIndicationCallback(MakeBoundCallback(&CoordinatorDataIndication, i, coorDevice));
 
         uint8_t id = i + 1;
