@@ -27,6 +27,10 @@ static const double ENV_TX_POWER = 0.0;
 static const double ENV_REF_LOSS = 40.0;   
 static const double ENV_EXPONENT = 2.0;
 
+// トンネル坑道内の対数正規シャドウイング（RSSI揺らぎ）の標準偏差 σ [dB]
+static double g_shadowingStdDb = 2.75;
+static Ptr<NormalRandomVariable> g_rssiNoiseGenerator;
+
 // ==========================================
 // 【カプセル化】各ノードのローカルメモリ
 // ==========================================
@@ -123,7 +127,18 @@ static std::map<uint32_t, NodeContext> g_nodeContexts;
 static double EstimateDistanceFromRssi(int8_t rssi) 
 {
     double rssiAt1m = ENV_TX_POWER - ENV_REF_LOSS;
-    return std::pow(10.0, (rssiAt1m - static_cast<double>(rssi)) / (10.0 * ENV_EXPONENT));
+    double noisyRssi = static_cast<double>(rssi);
+
+    // トンネル坑道特有の対数正規シャドウイング（壁面散乱・人体遮蔽による揺らぎ X_σ）を付加
+    if (g_shadowingStdDb > 0.0 && g_rssiNoiseGenerator != nullptr) 
+    {
+        // NormalRandomVariable::GetValue(平均, 分散 = σ^2)
+        double variance = g_shadowingStdDb * g_shadowingStdDb;
+        double shadowingNoiseDb = g_rssiNoiseGenerator->GetValue(0.0, variance);
+        noisyRssi += shadowingNoiseDb;
+    }
+
+    return std::pow(10.0, (rssiAt1m - noisyRssi) / (10.0 * ENV_EXPONENT));
 }
 
 static Vector TrilateratePosition(double d1, double d2, double d3) 
@@ -726,6 +741,7 @@ int main(int argc, char* argv[])
     uint32_t numNodes = 10;
     CommandLine cmd(__FILE__);
     cmd.AddValue("numNodes", "Number of nodes", numNodes);
+    cmd.AddValue("sigma", "Shadowing standard deviation in dB (tunnel noise)", g_shadowingStdDb);
     cmd.Parse(argc, argv);
 
     std::string nodeStr = std::to_string(numNodes) + "Node";
@@ -733,7 +749,10 @@ int main(int argc, char* argv[])
     std::string pcapPrefix = "CoordinatorSOM-lr-wpan-" + nodeStr;
 
     RngSeedManager::SetSeed(5); 
-    RngSeedManager::SetRun(1);
+    RngSeedManager::SetRun(4);
+
+    // SeedとRunの設定後に乱数生成器を初期化する（反復試行の再現性確保）
+    g_rssiNoiseGenerator = CreateObject<NormalRandomVariable>();
 
     Config::SetDefault("ns3::LogDistancePropagationLossModel::ReferenceLoss", DoubleValue(ENV_REF_LOSS));
     Config::SetDefault("ns3::LogDistancePropagationLossModel::Exponent", DoubleValue(ENV_EXPONENT));
